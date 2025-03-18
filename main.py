@@ -5,13 +5,14 @@ import os
 import shutil
 import time
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 import re
 import uuid
 
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 from dotenv import load_dotenv
@@ -747,6 +748,181 @@ class ChatSession:
             self.messages.append({"role": "assistant", "content": error_msg})
             return self._format_openai_response(error_msg, request.model)
             
+    async def process_openai_stream_request(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+        """
+        处理流式响应请求
+        
+        Args:
+            request: OpenAI格式的请求，带有stream=True
+            
+        Yields:
+            SSE格式的流式响应片段
+        """
+        # 确保会话已初始化
+        if not self.initialized:
+            await self.initialize()
+        
+        # 将OpenAI格式的messages转换为我们系统使用的格式
+        self.messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
+        # 如果没有system消息，添加默认system消息
+        if not any(msg["role"] == "system" for msg in self.messages):
+            self.messages.insert(0, {"role": "system", "content": self.system_message})
+        
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:10]}"
+        created_time = int(time.time())
+        
+        try:
+            # 调用LLM获取回复
+            logging.info(f"处理OpenAI流式请求，消息数量: {len(self.messages)}")
+            llm_response = self.llm_client.get_response(self.messages)
+            logging.info(f"LLM原始回复: {llm_response}")
+            
+            # 处理空响应或错误的情况
+            if llm_response == "[空响应]" or llm_response.startswith("Error:"):
+                error_msg = "我暂时无法回答这个问题，请稍后再试。"
+                self.messages.append({"role": "assistant", "content": error_msg})
+                
+                # 返回错误消息的流式响应
+                yield self._format_stream_chunk(response_id, created_time, request.model, error_msg, 0, "")
+                yield self._format_stream_chunk(response_id, created_time, request.model, "", -1, "stop")
+                return
+                
+            # 处理工具调用 - 在流式响应情况下暂不支持工具调用
+            # 如果检测到工具调用，转为非流式处理并一次性返回结果
+            try:
+                json.loads(llm_response.strip())
+                # 如果解析成功，说明这是JSON格式，可能是工具调用
+                logging.info("检测到可能的工具调用，暂不支持流式处理，转为一次性返回")
+                
+                result = await self.process_llm_response(llm_response)
+                final_response = llm_response
+                
+                if result != llm_response:
+                    self.messages.append({"role": "assistant", "content": llm_response})
+                    self.messages.append({"role": "system", "content": result})
+                    final_response = self.llm_client.get_response(self.messages)
+                
+                # 返回最终结果的流式响应
+                yield self._format_stream_chunk(response_id, created_time, request.model, final_response, 0, "")
+                yield self._format_stream_chunk(response_id, created_time, request.model, "", -1, "stop")
+                
+                # 更新会话历史
+                self.messages.append({"role": "assistant", "content": final_response})
+                return
+            except json.JSONDecodeError:
+                # 不是JSON，继续正常处理
+                pass
+            
+            # 将响应拆分成较小的块（以句子为单位）进行流式返回
+            chunks = self._split_into_chunks(llm_response)
+            full_content = ""
+            
+            for i, chunk in enumerate(chunks):
+                full_content += chunk
+                yield self._format_stream_chunk(response_id, created_time, request.model, chunk, i, "")
+                await asyncio.sleep(0.01)  # 添加一点延迟，使流式效果更明显
+            
+            # 发送完成标记
+            yield self._format_stream_chunk(response_id, created_time, request.model, "", len(chunks), "stop")
+            
+            # 更新会话历史
+            self.messages.append({"role": "assistant", "content": full_content})
+            
+        except Exception as e:
+            logging.error(f"流式处理消息时出错: {e}", exc_info=True)
+            error_msg = "抱歉，我遇到了内部错误，请重新提问。"
+            
+            # 发送错误信息和完成标记
+            yield self._format_stream_chunk(response_id, created_time, request.model, error_msg, 0, "")
+            yield self._format_stream_chunk(response_id, created_time, request.model, "", 1, "stop")
+            
+            # 更新会话历史
+            self.messages.append({"role": "assistant", "content": error_msg})
+    
+    def _format_stream_chunk(self, id: str, created: int, model: str, content: str, 
+                             chunk_index: int, finish_reason: str = None) -> str:
+        """
+        格式化流式响应的单个数据块为SSE格式
+        
+        Args:
+            id: 响应ID
+            created: 创建时间戳
+            model: 模型名称
+            content: 当前块的内容
+            chunk_index: 块索引
+            finish_reason: 完成原因，如果是最后一块则为"stop"
+            
+        Returns:
+            SSE格式的数据块
+        """
+        delta = {"role": "assistant"}
+        if content:
+            delta["content"] = content
+        
+        chunk = {
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason
+                }
+            ]
+        }
+        
+        if chunk_index == -1:  # 表示最后一个块，添加使用情况统计
+            prompt_tokens = sum(TokenCounter.estimate_tokens(msg["content"]) for msg in self.messages if msg["role"] != "assistant")
+            completion_tokens = TokenCounter.estimate_tokens("".join(msg["content"] for msg in self.messages if msg["role"] == "assistant"))
+            
+            chunk["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    
+    def _split_into_chunks(self, text: str) -> List[str]:
+        """
+        将文本拆分成较小的块，以便流式返回
+        
+        Args:
+            text: 要拆分的文本
+            
+        Returns:
+            拆分后的文本块列表
+        """
+        # 使用标点符号作为分割点，确保每个块都是完整的句子
+        sentence_endings = ['. ', '! ', '? ', '。', '！', '？', '\n']
+        chunks = []
+        
+        # 如果文本太短，直接作为一个块返回
+        if len(text) < 20:
+            return [text]
+        
+        buffer = ""
+        for char in text:
+            buffer += char
+            
+            # 如果缓冲区达到一定长度且以句子结尾，则添加为一个块
+            if len(buffer) >= 10 and any(buffer.endswith(ending) for ending in sentence_endings):
+                chunks.append(buffer)
+                buffer = ""
+        
+        # 添加剩余部分
+        if buffer:
+            chunks.append(buffer)
+        
+        # 如果没有拆分成块，则按照固定长度拆分
+        if not chunks:
+            chunks = [text[i:i+20] for i in range(0, len(text), 20)]
+        
+        return chunks
+            
     def _format_openai_response(self, content: str, model: str) -> ChatCompletionResponse:
         """
         将内容格式化为OpenAI格式的响应
@@ -782,69 +958,6 @@ class ChatSession:
             )
         )
 
-    async def process_message(self, user_message: str) -> str:
-        """
-        处理用户消息并返回回复
-        
-        Args:
-            user_message: 用户输入的消息
-            
-        Returns:
-            助手的回复
-        """
-        # 确保会话已初始化
-        if not self.initialized:
-            await self.initialize()
-            
-        try:
-            # 添加用户消息到会话历史
-            self.messages.append({"role": "user", "content": user_message})
-            
-            logging.info(f"正在处理用户消息: {user_message}")
-            # 调用LLM获取回复
-            llm_response = self.llm_client.get_response(self.messages)
-            logging.info(f"LLM原始回复: {llm_response}")
-            
-            # 处理空响应的情况
-            if llm_response == "[空响应]":
-                logging.warning("收到空响应")
-                error_response = "我暂时无法回答这个问题，请尝试重新表述。"
-                self.messages.append({"role": "assistant", "content": error_response})
-                return error_response
-                
-            # 处理API错误的情况
-            if llm_response.startswith("Error:"):
-                logging.warning(f"API错误: {llm_response}")
-                error_response = "抱歉，我遇到了通信问题。请稍后再试。"
-                self.messages.append({"role": "assistant", "content": error_response})
-                return error_response
-
-            # 处理工具调用
-            result = await self.process_llm_response(llm_response)
-            
-            final_response = llm_response
-            
-            # 如果LLM回复是工具调用，则继续处理工具执行结果
-            if result != llm_response:
-                self.messages.append({"role": "assistant", "content": llm_response})
-                self.messages.append({"role": "system", "content": result})
-
-                logging.info("处理工具执行结果...")
-                logging.debug(f"发送给LLM的消息: {self.messages}")
-                final_response = self.llm_client.get_response(self.messages)
-                logging.info(f"最终回复: {final_response}")
-                
-            # 添加最终回复到会话历史
-            self.messages.append({"role": "assistant", "content": final_response})
-            return final_response
-                
-        except Exception as e:
-            logging.error(f"处理消息时出错: {e}", exc_info=True)
-            error_message = f"处理消息时出错: {str(e)}"
-            self.messages.append({"role": "assistant", "content": "抱歉，我遇到了内部错误，请重新提问。"})
-            return "抱歉，我遇到了内部错误，请重新提问。"
-
-
 # API路由定义
 @app.get("/")
 async def root():
@@ -876,13 +989,13 @@ async def chat(request: ChatRequest):
     
     return ChatResponse(response=response, session_id=session_id)
 
-# 添加OpenAI兼容的API端点
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+# 修改OpenAI兼容的API端点，支持流式响应
+@app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """处理OpenAI兼容格式的聊天请求"""
+    """处理OpenAI兼容格式的聊天请求，支持流式响应"""
     global servers_initialized, all_servers, llm_client_instance, chat_sessions
     
-    logging.info(f"接收到OpenAI格式的聊天请求: 模型={request.model}, 消息数量={len(request.messages)}")
+    logging.info(f"接收到OpenAI格式的聊天请求: 模型={request.model}, 消息数量={len(request.messages)}, 流式={request.stream}")
     
     # 确保服务器已初始化
     if not servers_initialized:
@@ -896,10 +1009,31 @@ async def chat_completions(request: ChatCompletionRequest):
     
     session = chat_sessions[session_id]
     
-    # 处理OpenAI格式的请求
-    response = await session.process_openai_request(request)
-    
-    return response
+    # 处理流式响应请求
+    if request.stream:
+        logging.info("处理流式响应请求")
+        
+        # 设置用于异步生成响应流的生成器函数
+        async def stream_generator():
+            async for chunk in session.process_openai_stream_request(request):
+                yield chunk
+            yield "data: [DONE]\n\n"  # 标志流结束
+            
+        # 返回流式响应
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream",
+                "X-Accel-Buffering": "no"  # 禁用Nginx缓冲
+            }
+        )
+    else:
+        # 处理普通（非流式）请求
+        response = await session.process_openai_request(request)
+        return response
 
 # 添加OpenAI兼容的模型列表端点
 @app.get("/v1/models")

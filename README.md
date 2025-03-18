@@ -10,6 +10,7 @@
 - 自动重试机制和错误处理
 - 支持跨域请求(CORS)
 - **新增**: 支持OpenAI兼容的API格式
+- **新增**: 支持流式响应（Streaming）
 
 ## 安装
 
@@ -101,7 +102,7 @@ python main.py
 
 ##### POST /v1/chat/completions
 
-发送聊天消息并获取回复，与OpenAI API格式完全兼容。
+发送聊天消息并获取回复，与OpenAI API格式完全兼容。支持普通响应和流式响应。
 
 请求体格式:
 ```json
@@ -112,11 +113,12 @@ python main.py
     {"role": "user", "content": "你好，介绍一下自己。"}
   ],
   "temperature": 0.7,
-  "max_tokens": 4096
+  "max_tokens": 4096,
+  "stream": false  // 设置为true启用流式响应
 }
 ```
 
-响应格式:
+**普通响应格式:**
 ```json
 {
   "id": "chatcmpl-123abc456def",
@@ -141,12 +143,30 @@ python main.py
 }
 ```
 
+**流式响应格式:**
+
+当使用`stream=true`参数时，服务器会返回一系列的SSE (Server-Sent Events)事件：
+
+```
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":"！"},"finish_reason":null}]}
+
+... [更多内容块]
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
 ### 客户端示例
 
 提供了两个客户端示例：
 
 1. `client.py` - 使用简化API的命令行客户端
-2. `test_openai_client.py` - 使用OpenAI兼容API的测试客户端
+2. `test_openai_client.py` - 使用OpenAI兼容API的测试客户端，支持普通和流式响应
 
 运行客户端示例:
 
@@ -161,6 +181,8 @@ python test_openai_client.py
 ## 使用OpenAI SDK
 
 由于本服务兼容OpenAI的API格式，您可以直接使用官方的OpenAI SDK或其他第三方库来调用本服务。只需要将base_url设置为本服务的地址即可:
+
+### 普通响应示例
 
 ```python
 from openai import OpenAI
@@ -183,6 +205,35 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### 流式响应示例
+
+```python
+from openai import OpenAI
+
+# 创建客户端时指定base_url
+client = OpenAI(
+    api_key="任意字符串，不会实际使用",
+    base_url="http://localhost:8000/v1"
+)
+
+# 流式响应调用
+stream = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "system", "content": "你是一个有用的助手。"},
+        {"role": "user", "content": "讲一个关于人工智能的故事"}
+    ],
+    stream=True  # 启用流式响应
+)
+
+# 逐块处理响应
+print("AI回复: ", end="")
+for chunk in stream:
+    if chunk.choices[0].delta.content is not None:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
+```
+
 ## 自定义
 
 - 修改`servers_config.json`添加或移除MCP服务器
@@ -195,6 +246,15 @@ print(response.choices[0].message.content)
 - 考虑添加API认证机制
 - 可以根据需要实现会话的持久化存储
 - 目前token计数是估算的，不保证与OpenAI的计算完全一致
+- 流式响应模式下暂不支持工具调用，如检测到工具调用会转为普通响应
+
+## 流式响应的限制
+
+当使用流式响应时，有以下限制：
+
+1. 不支持MCP工具调用 - 如果检测到模型返回的内容是工具调用（JSON格式），系统会自动切换到非流式模式处理
+2. 工具执行结果不会实时流式返回，会等待工具执行完成后一次性返回
+3. 流式响应中间不能被中断，必须等待完整响应完成
 
 ## 环境要求
 
@@ -203,6 +263,11 @@ print(response.choices[0].message.content)
   - httpx
   - python-dotenv
   - mcp-sdk
+  - fastapi
+  - uvicorn
+  - pydantic
+  - requests
+  - sseclient-py
 
 ## 配置
 
