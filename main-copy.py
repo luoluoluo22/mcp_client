@@ -3,17 +3,11 @@ import json
 import logging
 import os
 import shutil
-import time
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 import re
-import uuid
 
 import httpx
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import uvicorn
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -25,98 +19,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# 创建FastAPI应用
-app = FastAPI(title="MCP聊天API", description="通过HTTP API与MCP工具集成的聊天服务，兼容OpenAI API格式")
-
-# 添加CORS中间件，允许跨域请求
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境应该更具体
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 定义OpenAI兼容的请求和响应模型
-class Message(BaseModel):
-    role: str
-    content: str
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    max_tokens: Optional[int] = 4096
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
-
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: Message
-    finish_reason: str = "stop"
-
-class UsageInfo(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: UsageInfo
-
-# 定义原有的简化请求和响应模型
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-
-# 全局变量，保存会话状态
-chat_sessions = {}
-servers_initialized = False
-all_servers = []
-llm_client_instance = None
-
-# 添加新类TokenCounter用于估计token数量
-class TokenCounter:
-    """简单的token计数器，用于估计token数量"""
-    
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
-        """
-        估计文本中的token数量（简化版，仅供参考）
-        
-        中文和英文的token计数方式不同，这里采用简化方法：
-        - 每个中文字符约为1.5个token
-        - 每个英文单词约为1.3个token
-        - 标点符号和空格约为0.5个token
-        """
-        if not text:
-            return 0
-            
-        # 计算中文字符数量
-        chinese_char_count = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
-        
-        # 计算英文单词数量（简化版）
-        english_words = len(re.findall(r'[a-zA-Z]+', text))
-        
-        # 计算标点符号和空格数量
-        punctuation_count = sum(1 for char in text if char in ',.!?;:()[]{}"\'`~@#$%^&*_+-=<>/\\| ')
-        
-        # 计算总token数
-        total_tokens = (chinese_char_count * 1.5) + (english_words * 1.3) + (punctuation_count * 0.5)
-        
-        return max(1, int(total_tokens))
 
 class Configuration:
     """Manages configuration and environment variables for the MCP client."""
@@ -501,85 +403,6 @@ class ChatSession:
     def __init__(self, servers: list[Server], llm_client: LLMClient) -> None:
         self.servers: list[Server] = servers
         self.llm_client: LLMClient = llm_client
-        self.messages: List[Dict[str, str]] = []
-        self.session_id: str = ""
-        self.tools_description: str = ""
-        self.system_message: str = ""
-        self.initialized: bool = False
-
-    async def initialize(self) -> None:
-        """初始化聊天会话，包括准备服务器和加载工具"""
-        if self.initialized:
-            return
-            
-        # 初始化服务器，添加重试机制
-        initialized_servers = []
-        for server in self.servers:
-            max_retries = 2
-            retry_delay = 1.5
-            
-            for attempt in range(max_retries):
-                try:
-                    logging.info(f"正在初始化服务器: {server.name}... (尝试 {attempt+1}/{max_retries})")
-                    await server.initialize()
-                    initialized_servers.append(server)
-                    break  # 初始化成功，跳出重试循环
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logging.warning(f"服务器 {server.name} 初始化失败 (尝试 {attempt+1}/{max_retries}): {e}")
-                        logging.info(f"将在 {retry_delay} 秒后重试...")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # 指数退避
-                    else:
-                        logging.error(f"服务器 {server.name} 初始化失败，已达到最大重试次数: {e}")
-        
-        # 如果所有服务器都初始化失败，则抛出异常
-        if not initialized_servers:
-            logging.error("所有服务器初始化失败，会话无法启动")
-            raise RuntimeError("所有服务器初始化失败，会话无法启动")
-            
-        # 更新服务器列表为成功初始化的服务器
-        self.servers = initialized_servers
-        
-        # 获取可用工具
-        all_tools = []
-        for server in self.servers:
-            try:
-                tools = await server.list_tools()
-                all_tools.extend(tools)
-                logging.info(f"服务器 {server.name} 提供的工具数量: {len(tools)}")
-            except Exception as e:
-                logging.error(f"无法从服务器 {server.name} 获取工具列表: {e}")
-        
-        if not all_tools:
-            logging.warning("没有可用的工具，会话将无法提供工具功能")
-            
-        self.tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
-
-        self.system_message = (
-            "You are a helpful assistant with access to these tools:\n\n"
-            f"{self.tools_description}\n"
-            "Choose the appropriate tool based on the user's question. "
-            "If no tool is needed, reply directly.\n\n"
-            "IMPORTANT: When you need to use a tool, you must ONLY respond with "
-            "the exact JSON object format below, nothing else:\n"
-            "{\n"
-            '    "tool": "tool-name",\n'
-            '    "arguments": {\n'
-            '        "argument-name": "value"\n'
-            "    }\n"
-            "}\n\n"
-            "After receiving a tool's response:\n"
-            "1. Transform the raw data into a natural, conversational response\n"
-            "2. Keep responses concise but informative\n"
-            "3. Focus on the most relevant information\n"
-            "4. Use appropriate context from the user's question\n"
-            "5. Avoid simply repeating the raw data\n\n"
-            "Please use only the tools that are explicitly defined above."
-        )
-
-        self.messages = [{"role": "system", "content": self.system_message}]
-        self.initialized = True
 
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
@@ -688,256 +511,147 @@ class ChatSession:
         # 如果没有识别出工具调用，则返回原始响应
         return llm_response
 
-    async def process_openai_request(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        """
-        处理符合OpenAI格式的请求
-        
-        Args:
-            request: OpenAI格式的请求
-            
-        Returns:
-            OpenAI格式的响应
-        """
-        # 确保会话已初始化
-        if not self.initialized:
-            await self.initialize()
-        
-        # 将OpenAI格式的messages转换为我们系统使用的格式
-        self.messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        # 如果没有system消息，添加默认system消息
-        if not any(msg["role"] == "system" for msg in self.messages):
-            self.messages.insert(0, {"role": "system", "content": self.system_message})
-        
+    async def start(self) -> None:
+        """Main chat session handler."""
         try:
-            # 调用LLM获取回复
-            logging.info(f"处理OpenAI格式请求，消息数量: {len(self.messages)}")
-            llm_response = self.llm_client.get_response(self.messages)
-            logging.info(f"LLM原始回复: {llm_response}")
-            
-            # 处理空响应或错误的情况
-            if llm_response == "[空响应]" or llm_response.startswith("Error:"):
-                error_msg = "我暂时无法回答这个问题，请稍后再试。"
-                self.messages.append({"role": "assistant", "content": error_msg})
-                return self._format_openai_response(error_msg, request.model)
+            # 初始化服务器，添加重试机制
+            initialized_servers = []
+            for server in self.servers:
+                max_retries = 2
+                retry_delay = 1.5
                 
-            # 处理工具调用
-            result = await self.process_llm_response(llm_response)
+                for attempt in range(max_retries):
+                    try:
+                        logging.info(f"正在初始化服务器: {server.name}... (尝试 {attempt+1}/{max_retries})")
+                        await server.initialize()
+                        initialized_servers.append(server)
+                        break  # 初始化成功，跳出重试循环
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logging.warning(f"服务器 {server.name} 初始化失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                            logging.info(f"将在 {retry_delay} 秒后重试...")
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2  # 指数退避
+                        else:
+                            logging.error(f"服务器 {server.name} 初始化失败，已达到最大重试次数: {e}")
+                            if initialized_servers:
+                                logging.info(f"将继续使用已成功初始化的 {len(initialized_servers)} 个服务器")
+                            else:
+                                logging.error("没有可用的服务器，会话无法启动")
+                                return
             
-            final_response = llm_response
+            # 如果所有服务器都初始化失败，则退出
+            if not initialized_servers:
+                logging.error("所有服务器初始化失败，会话无法启动")
+                return
+                
+            # 更新服务器列表为成功初始化的服务器
+            self.servers = initialized_servers
             
-            # 如果LLM回复是工具调用，则继续处理工具执行结果
-            if result != llm_response:
-                self.messages.append({"role": "assistant", "content": llm_response})
-                self.messages.append({"role": "system", "content": result})
+            # 获取可用工具
+            all_tools = []
+            for server in self.servers:
+                try:
+                    tools = await server.list_tools()
+                    all_tools.extend(tools)
+                    logging.info(f"服务器 {server.name} 提供的工具数量: {len(tools)}")
+                except Exception as e:
+                    logging.error(f"无法从服务器 {server.name} 获取工具列表: {e}")
+            
+            if not all_tools:
+                logging.error("没有可用的工具，会话无法提供工具功能")
+                
+            tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
 
-                logging.info("处理工具执行结果...")
-                final_response = self.llm_client.get_response(self.messages)
-                logging.info(f"最终回复: {final_response}")
-                
-            # 添加最终回复到会话历史
-            self.messages.append({"role": "assistant", "content": final_response})
-            
-            # 返回OpenAI格式的响应
-            return self._format_openai_response(final_response, request.model)
-                
-        except Exception as e:
-            logging.error(f"处理消息时出错: {e}", exc_info=True)
-            error_msg = "抱歉，我遇到了内部错误，请重新提问。"
-            self.messages.append({"role": "assistant", "content": error_msg})
-            return self._format_openai_response(error_msg, request.model)
-            
-    def _format_openai_response(self, content: str, model: str) -> ChatCompletionResponse:
-        """
-        将内容格式化为OpenAI格式的响应
-        
-        Args:
-            content: 助手的回复内容
-            model: 使用的模型名称
-            
-        Returns:
-            OpenAI格式的响应对象
-        """
-        # 估算token数量
-        prompt_tokens = sum(TokenCounter.estimate_tokens(msg["content"]) for msg in self.messages if msg["role"] != "assistant")
-        completion_tokens = TokenCounter.estimate_tokens(content)
-        total_tokens = prompt_tokens + completion_tokens
-        
-        # 创建响应对象
-        return ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4().hex[:10]}",
-            created=int(time.time()),
-            model=model,
-            choices=[
-                ChatCompletionChoice(
-                    index=0,
-                    message=Message(role="assistant", content=content),
-                    finish_reason="stop"
-                )
-            ],
-            usage=UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens
+            system_message = (
+                "You are a helpful assistant with access to these tools:\n\n"
+                f"{tools_description}\n"
+                "Choose the appropriate tool based on the user's question. "
+                "If no tool is needed, reply directly.\n\n"
+                "IMPORTANT: When you need to use a tool, you must ONLY respond with "
+                "the exact JSON object format below, nothing else:\n"
+                "{\n"
+                '    "tool": "tool-name",\n'
+                '    "arguments": {\n'
+                '        "argument-name": "value"\n'
+                "    }\n"
+                "}\n\n"
+                "After receiving a tool's response:\n"
+                "1. Transform the raw data into a natural, conversational response\n"
+                "2. Keep responses concise but informative\n"
+                "3. Focus on the most relevant information\n"
+                "4. Use appropriate context from the user's question\n"
+                "5. Avoid simply repeating the raw data\n\n"
+                "Please use only the tools that are explicitly defined above."
             )
-        )
 
-    async def process_message(self, user_message: str) -> str:
-        """
-        处理用户消息并返回回复
-        
-        Args:
-            user_message: 用户输入的消息
-            
-        Returns:
-            助手的回复
-        """
-        # 确保会话已初始化
-        if not self.initialized:
-            await self.initialize()
-            
-        try:
-            # 添加用户消息到会话历史
-            self.messages.append({"role": "user", "content": user_message})
-            
-            logging.info(f"正在处理用户消息: {user_message}")
-            # 调用LLM获取回复
-            llm_response = self.llm_client.get_response(self.messages)
-            logging.info(f"LLM原始回复: {llm_response}")
-            
-            # 处理空响应的情况
-            if llm_response == "[空响应]":
-                logging.warning("收到空响应")
-                error_response = "我暂时无法回答这个问题，请尝试重新表述。"
-                self.messages.append({"role": "assistant", "content": error_response})
-                return error_response
-                
-            # 处理API错误的情况
-            if llm_response.startswith("Error:"):
-                logging.warning(f"API错误: {llm_response}")
-                error_response = "抱歉，我遇到了通信问题。请稍后再试。"
-                self.messages.append({"role": "assistant", "content": error_response})
-                return error_response
+            messages = [{"role": "system", "content": system_message}]
 
-            # 处理工具调用
-            result = await self.process_llm_response(llm_response)
-            
-            final_response = llm_response
-            
-            # 如果LLM回复是工具调用，则继续处理工具执行结果
-            if result != llm_response:
-                self.messages.append({"role": "assistant", "content": llm_response})
-                self.messages.append({"role": "system", "content": result})
+            while True:
+                try:
+                    user_input = input("You: ").strip().lower()
+                    if user_input in ["quit", "exit"]:
+                        logging.info("\n退出中...")
+                        break
 
-                logging.info("处理工具执行结果...")
-                logging.debug(f"发送给LLM的消息: {self.messages}")
-                final_response = self.llm_client.get_response(self.messages)
-                logging.info(f"最终回复: {final_response}")
-                
-            # 添加最终回复到会话历史
-            self.messages.append({"role": "assistant", "content": final_response})
-            return final_response
-                
-        except Exception as e:
-            logging.error(f"处理消息时出错: {e}", exc_info=True)
-            error_message = f"处理消息时出错: {str(e)}"
-            self.messages.append({"role": "assistant", "content": "抱歉，我遇到了内部错误，请重新提问。"})
-            return "抱歉，我遇到了内部错误，请重新提问。"
+                    messages.append({"role": "user", "content": user_input})
+                    
+                    logging.info("正在等待回复...")
+                    llm_response = self.llm_client.get_response(messages)
+                    logging.info("\nAssistant: %s", llm_response)
+                    
+                    # 处理空响应的情况
+                    if llm_response == "[空响应]":
+                        logging.warning("收到空响应，请重新提问")
+                        messages.append({"role": "assistant", "content": "我暂时无法回答这个问题，请尝试重新表述。"})
+                        continue
+                        
+                    # 处理API错误的情况
+                    if llm_response.startswith("Error:"):
+                        logging.warning(f"API错误: {llm_response}")
+                        messages.append({"role": "assistant", "content": "抱歉，我遇到了通信问题。请稍后再试。"})
+                        continue
+
+                    result = await self.process_llm_response(llm_response)
+
+                    if result != llm_response:
+                        messages.append({"role": "assistant", "content": llm_response})
+                        messages.append({"role": "system", "content": result})
+
+                        logging.info("处理工具执行结果...")
+                        logging.debug(f"发送给LLM的消息: {messages}")
+                        final_response = self.llm_client.get_response(messages)
+                        logging.info("\n最终回复: %s", final_response)
+                        messages.append(
+                            {"role": "assistant", "content": final_response}
+                        )
+                    else:
+                        messages.append({"role": "assistant", "content": llm_response})
+
+                except KeyboardInterrupt:
+                    logging.info("\n退出中...")
+                    break
+                except Exception as e:
+                    logging.error(f"会话处理错误: {e}", exc_info=True)
+                    try:
+                        messages.append({"role": "assistant", "content": "抱歉，我遇到了内部错误，请重新提问。"})
+                    except:
+                        pass
+
+        finally:
+            await self.cleanup_servers()
 
 
-# API路由定义
-@app.get("/")
-async def root():
-    """API根路径，返回简单的欢迎信息"""
-    return {"message": "欢迎使用MCP聊天API，支持简化API('/chat')和OpenAI兼容API('/v1/chat/completions')"}
-
-# 保留原有的简化API端点
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """处理简化格式的聊天请求"""
-    global servers_initialized, all_servers, llm_client_instance, chat_sessions
-    
-    logging.info(f"接收到聊天请求: {request.message}，会话ID: {request.session_id}")
-    
-    # 确保服务器已初始化
-    if not servers_initialized:
-        await initialize_servers()
-    
-    # 获取或创建会话
-    session_id = request.session_id or f"session_{len(chat_sessions) + 1}"
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = ChatSession(all_servers.copy(), llm_client_instance)
-        logging.info(f"创建新会话: {session_id}")
-    
-    session = chat_sessions[session_id]
-    
-    # 处理消息并获取回复
-    response = await session.process_message(request.message)
-    
-    return ChatResponse(response=response, session_id=session_id)
-
-# 添加OpenAI兼容的API端点
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completions(request: ChatCompletionRequest):
-    """处理OpenAI兼容格式的聊天请求"""
-    global servers_initialized, all_servers, llm_client_instance, chat_sessions
-    
-    logging.info(f"接收到OpenAI格式的聊天请求: 模型={request.model}, 消息数量={len(request.messages)}")
-    
-    # 确保服务器已初始化
-    if not servers_initialized:
-        await initialize_servers()
-        
-    # 使用OpenAI请求中的user字段作为会话ID，如果没有则创建新ID
-    session_id = request.user or f"openai_session_{len(chat_sessions) + 1}"
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = ChatSession(all_servers.copy(), llm_client_instance)
-        logging.info(f"创建新的OpenAI兼容会话: {session_id}")
-    
-    session = chat_sessions[session_id]
-    
-    # 处理OpenAI格式的请求
-    response = await session.process_openai_request(request)
-    
-    return response
-
-# 添加OpenAI兼容的模型列表端点
-@app.get("/v1/models")
-async def list_models():
-    """返回支持的模型列表(OpenAI兼容格式)"""
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "gpt-3.5-turbo",
-                "object": "model",
-                "created": int(time.time()) - 10000,
-                "owned_by": "organization-owner"
-            },
-            {
-                "id": "gpt-4",
-                "object": "model",
-                "created": int(time.time()) - 5000,
-                "owned_by": "organization-owner"
-            }
-        ]
-    }
-
-async def initialize_servers():
-    """初始化所有服务器，只需要执行一次"""
-    global servers_initialized, all_servers, llm_client_instance
-    
-    logging.info("正在初始化服务器...")
-    
-    # 加载配置
+async def main() -> None:
+    """Initialize and run the chat session."""
     config = Configuration()
     
-    # 检查jianshu服务器可用性
+    # 在启动前检查jianshu服务器是否可用
     jianshu_server_url = "http://38.55.129.183:8015/sse"
     logging.info(f"正在检查jianshu服务器可用性: {jianshu_server_url}")
     
     try:
-        timeout = 5.0
+        timeout = 5.0  # 较短的超时时间，只用于检查
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(jianshu_server_url)
             logging.info(f"检查结果: HTTP {response.status_code}")
@@ -945,51 +659,17 @@ async def initialize_servers():
                 logging.warning(f"警告: jianshu服务器返回了错误状态码: {response.status_code}")
     except Exception as e:
         logging.warning(f"无法连接到jianshu服务器 ({jianshu_server_url}): {e}")
-        logging.warning("简书相关功能可能无法使用。")
+        logging.warning("简书相关功能可能无法使用。如果您需要这些功能，请检查网络连接或服务器状态。")
+        # 继续执行，因为我们仍然可以使用其他服务器
     
-    # 加载服务器配置和创建实例
     server_config = config.load_config("servers_config.json")
-    all_servers = [
+    servers = [
         Server(name, srv_config)
         for name, srv_config in server_config["mcpServers"].items()
     ]
-    
-    # 创建LLM客户端
-    llm_client_instance = LLMClient(config.llm_api_key, config.base_url, config.default_model)
-    
-    servers_initialized = True
-    logging.info("服务器初始化完成")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI关闭事件处理，用于清理资源"""
-    logging.info("服务关闭中，清理资源...")
-    
-    # 清理所有会话的服务器资源
-    for session_id, session in chat_sessions.items():
-        try:
-            await session.cleanup_servers()
-            logging.info(f"已清理会话 {session_id} 的资源")
-        except Exception as e:
-            logging.warning(f"清理会话 {session_id} 资源时出错: {e}")
-    
-    logging.info("所有资源已清理完毕")
-
-async def main() -> None:
-    """初始化并运行API服务器"""
-    # 直接启动uvicorn，而不是初始化聊天会话
-    port = int(os.getenv("PORT", "8000"))
-    host = os.getenv("HOST", "0.0.0.0")
-    
-    logging.info(f"启动API服务器在 {host}:{port}")
-    config = uvicorn.Config(
-        app=app,
-        host=host,
-        port=port,
-        log_level="info"
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
+    llm_client = LLMClient(config.llm_api_key, config.base_url, config.default_model)
+    chat_session = ChatSession(servers, llm_client)
+    await chat_session.start()
 
 
 if __name__ == "__main__":

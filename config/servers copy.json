@@ -1,0 +1,10 @@
+{
+  "sqlite": {
+    "command": "C:\\Users\\Administrator\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\Scripts\\uvx.exe",
+    "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
+  },
+  "jianshu": {
+    "type": "sse",
+    "url": "http://38.55.129.183:8015/sse"
+  }
+}

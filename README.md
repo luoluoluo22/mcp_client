@@ -1,135 +1,200 @@
-# OpenAI兼容API服务（MCP后端）
+# MCP聊天API服务
 
-这个项目提供了一个与OpenAI API兼容的HTTP服务，使用MCP（多通道处理器）作为后端。它允许客户端通过标准的OpenAI API格式访问各种工具和服务。
+该项目将MCP工具集成到一个HTTP API服务中，允许通过API请求与大模型进行交互并使用各种工具。现在支持两种API格式：简化API和OpenAI兼容API。
 
 ## 功能特点
 
-- 兼容OpenAI API格式，便于集成到现有应用
-- 支持ChatGPT风格的聊天完成API
-- 提供工具执行功能
-- 支持文本嵌入（目前是占位实现）
-- 自动初始化和管理MCP服务器连接
-- 完善的错误处理和日志记录
+- 将命令行聊天界面转换为HTTP API服务
+- 支持使用MCP工具集
+- 维护多个会话的上下文
+- 自动重试机制和错误处理
+- 支持跨域请求(CORS)
+- **新增**: 支持OpenAI兼容的API格式
 
 ## 安装
 
-1. 克隆此仓库：
-
-```bash
-git clone <仓库URL>
-cd <仓库目录>
-```
-
-2. 安装依赖：
+1. 克隆仓库
+2. 安装依赖:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. 准备环境变量（创建`.env`文件）：
+3. 创建一个`.env`文件，设置以下环境变量:
 
 ```
-OPENAI_API_KEY=你的OpenAI_API密钥
+OPENAI_API_KEY=你的OpenAI API密钥
 OPENAI_BASE_URL=https://api.openai.com/v1
 DEFAULT_MODEL=gpt-3.5-turbo
+PORT=8000
+HOST=0.0.0.0
 ```
+
+4. 确保`servers_config.json`文件正确配置了所需的MCP服务器
 
 ## 使用方法
 
 ### 启动服务器
 
 ```bash
-python openai_compatible_api.py
+python main.py
 ```
 
-服务器默认在`http://localhost:8000`上运行。
+服务器默认运行在`http://localhost:8000`
 
 ### API端点
 
-#### 1. 聊天完成
+#### 简化API
 
+##### GET /
+
+返回简单的欢迎消息。
+
+##### POST /chat
+
+发送聊天消息并获取回复。
+
+请求体格式:
+```json
+{
+  "message": "你的问题或消息",
+  "session_id": "可选的会话ID"
+}
 ```
-POST /v1/chat/completions
+
+如果不提供`session_id`，服务器会创建一个新的会话。
+
+响应格式:
+```json
+{
+  "response": "大模型的回复",
+  "session_id": "会话ID，用于后续请求"
+}
 ```
 
-请求示例：
+#### OpenAI兼容API
 
+##### GET /v1/models
+
+获取可用模型列表。
+
+响应格式:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-3.5-turbo",
+      "object": "model",
+      "created": 1677610602,
+      "owned_by": "organization-owner"
+    },
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1677610602,
+      "owned_by": "organization-owner"
+    }
+  ]
+}
+```
+
+##### POST /v1/chat/completions
+
+发送聊天消息并获取回复，与OpenAI API格式完全兼容。
+
+请求体格式:
 ```json
 {
   "model": "gpt-3.5-turbo",
   "messages": [
     {"role": "system", "content": "你是一个有用的助手。"},
-    {"role": "user", "content": "介绍一下Python语言的主要特点。"}
+    {"role": "user", "content": "你好，介绍一下自己。"}
   ],
-  "temperature": 0.7
+  "temperature": 0.7,
+  "max_tokens": 4096
 }
 ```
 
-#### 2. 获取可用工具列表
-
-```
-GET /v1/tools
-```
-
-#### 3. 执行工具
-
-```
-POST /v1/tools
-```
-
-请求示例：
-
+响应格式:
 ```json
 {
-  "tool": "工具名称",
-  "arguments": {
-    "参数1": "值1",
-    "参数2": "值2"
+  "id": "chatcmpl-123abc456def",
+  "object": "chat.completion",
+  "created": 1677610602,
+  "model": "gpt-3.5-turbo",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "你好！我是一个AI助手..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 30,
+    "completion_tokens": 100,
+    "total_tokens": 130
   }
 }
 ```
 
-#### 4. 嵌入向量（模拟实现）
+### 客户端示例
 
-```
-POST /v1/embeddings
-```
+提供了两个客户端示例：
 
-请求示例：
+1. `client.py` - 使用简化API的命令行客户端
+2. `test_openai_client.py` - 使用OpenAI兼容API的测试客户端
 
-```json
-{
-  "model": "text-embedding-ada-002",
-  "input": ["这是一个测试文本"]
-}
-```
-
-## 测试客户端
-
-我们提供了一个测试客户端`test_client.py`来展示如何调用API。运行以下命令来测试服务：
+运行客户端示例:
 
 ```bash
-python test_client.py
+# 简化API客户端
+python client.py
+
+# OpenAI兼容API客户端
+python test_openai_client.py
 ```
 
-## 配置
+## 使用OpenAI SDK
 
-服务器配置位于`servers_config.json`文件中，它定义了MCP服务器的连接信息。
+由于本服务兼容OpenAI的API格式，您可以直接使用官方的OpenAI SDK或其他第三方库来调用本服务。只需要将base_url设置为本服务的地址即可:
 
-## 文件结构
+```python
+from openai import OpenAI
 
-- `openai_compatible_api.py` - 主API服务器
-- `main.py` - 核心MCP功能
-- `test_client.py` - 测试客户端
-- `requirements.txt` - 依赖列表
-- `servers_config.json` - 服务器配置文件
-- `.env` - 环境变量（需要自行创建）
+# 创建客户端时指定base_url
+client = OpenAI(
+    api_key="任意字符串，不会实际使用",
+    base_url="http://localhost:8000/v1"
+)
+
+# 使用方法与调用OpenAI API完全一致
+response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "system", "content": "你是一个有用的助手。"},
+        {"role": "user", "content": "你好，请问今天天气如何？"}
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+## 自定义
+
+- 修改`servers_config.json`添加或移除MCP服务器
+- 在`.env`文件中更改模型或其他配置
+- 调整`main.py`中的超时设置和重试策略
 
 ## 注意事项
 
-- 目前嵌入API返回的是随机值，仅用于演示目的
-- 在生产环境中，应该更改CORS设置为特定的源，而不是`"*"`
-- 确保您的服务器配置正确，并且所有必要的依赖项都已安装
+- 生产环境中应该限制CORS的`allow_origins`
+- 考虑添加API认证机制
+- 可以根据需要实现会话的持久化存储
+- 目前token计数是估算的，不保证与OpenAI的计算完全一致
 
 ## 环境要求
 
@@ -150,6 +215,8 @@ python test_client.py
 OPENAI_API_KEY=你的API密钥
 OPENAI_BASE_URL=https://api.openai.com/v1  # 可选，默认为OpenAI官方地址
 DEFAULT_MODEL=gpt-3.5-turbo  # 可选，默认为gpt-3.5-turbo
+PORT=8000
+HOST=0.0.0.0
 
 # 简书配置（如果需要）
 JIANSHU_USER_ID=你的用户ID
