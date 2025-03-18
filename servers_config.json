@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sqlite": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
+    },
+    "jianshu": {
+      "type": "sse",
+      "url": "http://38.55.129.183:8015/sse"
+    }
+  }
+}
