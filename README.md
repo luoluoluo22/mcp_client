@@ -1,15 +1,135 @@
-# MCP 简单聊天机器人
+# OpenAI兼容API服务（MCP后端）
 
-这是一个基于 MCP (Multi-Channel Protocol) 的聊天机器人，支持多种服务集成，包括简书、SQLite等。
+这个项目提供了一个与OpenAI API兼容的HTTP服务，使用MCP（多通道处理器）作为后端。它允许客户端通过标准的OpenAI API格式访问各种工具和服务。
 
 ## 功能特点
 
-- 支持多种服务器连接（标准输入/输出和SSE）
-- 灵活的工具调用系统
-- 智能的对话管理
-- 详细的日志记录
-- 错误重试机制
-- 优雅的资源清理
+- 兼容OpenAI API格式，便于集成到现有应用
+- 支持ChatGPT风格的聊天完成API
+- 提供工具执行功能
+- 支持文本嵌入（目前是占位实现）
+- 自动初始化和管理MCP服务器连接
+- 完善的错误处理和日志记录
+
+## 安装
+
+1. 克隆此仓库：
+
+```bash
+git clone <仓库URL>
+cd <仓库目录>
+```
+
+2. 安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+3. 准备环境变量（创建`.env`文件）：
+
+```
+OPENAI_API_KEY=你的OpenAI_API密钥
+OPENAI_BASE_URL=https://api.openai.com/v1
+DEFAULT_MODEL=gpt-3.5-turbo
+```
+
+## 使用方法
+
+### 启动服务器
+
+```bash
+python openai_compatible_api.py
+```
+
+服务器默认在`http://localhost:8000`上运行。
+
+### API端点
+
+#### 1. 聊天完成
+
+```
+POST /v1/chat/completions
+```
+
+请求示例：
+
+```json
+{
+  "model": "gpt-3.5-turbo",
+  "messages": [
+    {"role": "system", "content": "你是一个有用的助手。"},
+    {"role": "user", "content": "介绍一下Python语言的主要特点。"}
+  ],
+  "temperature": 0.7
+}
+```
+
+#### 2. 获取可用工具列表
+
+```
+GET /v1/tools
+```
+
+#### 3. 执行工具
+
+```
+POST /v1/tools
+```
+
+请求示例：
+
+```json
+{
+  "tool": "工具名称",
+  "arguments": {
+    "参数1": "值1",
+    "参数2": "值2"
+  }
+}
+```
+
+#### 4. 嵌入向量（模拟实现）
+
+```
+POST /v1/embeddings
+```
+
+请求示例：
+
+```json
+{
+  "model": "text-embedding-ada-002",
+  "input": ["这是一个测试文本"]
+}
+```
+
+## 测试客户端
+
+我们提供了一个测试客户端`test_client.py`来展示如何调用API。运行以下命令来测试服务：
+
+```bash
+python test_client.py
+```
+
+## 配置
+
+服务器配置位于`servers_config.json`文件中，它定义了MCP服务器的连接信息。
+
+## 文件结构
+
+- `openai_compatible_api.py` - 主API服务器
+- `main.py` - 核心MCP功能
+- `test_client.py` - 测试客户端
+- `requirements.txt` - 依赖列表
+- `servers_config.json` - 服务器配置文件
+- `.env` - 环境变量（需要自行创建）
+
+## 注意事项
+
+- 目前嵌入API返回的是随机值，仅用于演示目的
+- 在生产环境中，应该更改CORS设置为特定的源，而不是`"*"`
+- 确保您的服务器配置正确，并且所有必要的依赖项都已安装
 
 ## 环境要求
 
@@ -18,14 +138,6 @@
   - httpx
   - python-dotenv
   - mcp-sdk
-
-## 安装
-
-1. 克隆项目到本地
-2. 安装依赖：
-```bash
-pip install -r requirements.txt
-```
 
 ## 配置
 
