@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import httpx
 
 # 导入main.py中的核心组件
 from main import Configuration, Server, LLMClient, ChatSession, Tool
@@ -170,14 +171,11 @@ async def chat_completions(request: ChatCompletionRequest):
     logging.info(f"收到聊天完成请求，使用模型: {request.model}")
     
     try:
-        # 初始化LLM客户端
-        llm_client = LLMClient(
-            api_key=config.llm_api_key, 
-            base_url=config.base_url,
-            default_model=request.model
-        )
+        # 输出更多调试信息
+        logging.debug(f"API基本URL: {config.base_url}")
+        logging.debug(f"请求参数: {request.dict()}")
         
-        # 使用我们内部的消息格式
+        # 将Pydantic模型消息转换为标准字典格式
         messages = [
             {"role": msg.role, "content": msg.content} 
             for msg in request.messages
@@ -187,7 +185,7 @@ async def chat_completions(request: ChatCompletionRequest):
             raise HTTPException(status_code=400, detail="消息列表不能为空")
         
         # 检查工具调用意图
-        if "tool" in messages[-1]["content"].lower() or "function" in messages[-1]["content"].lower():
+        if len(messages) > 0 and ("tool" in messages[-1]["content"].lower() or "function" in messages[-1]["content"].lower()):
             # 可能是工具调用请求，尝试解析工具调用
             try:
                 # 尝试提取工具调用的JSON
@@ -223,36 +221,89 @@ async def chat_completions(request: ChatCompletionRequest):
                 logging.error(f"处理工具调用时出错: {e}")
                 # 继续常规流程，不中断
         
-        # 获取LLM响应
-        logging.debug(f"向LLM发送消息: {messages}")
-        llm_response = llm_client.get_response(messages)
-        
-        if llm_response.startswith("Error:"):
-            raise HTTPException(status_code=500, detail=llm_response)
-            
-        # 创建OpenAI格式的响应
-        import time
-        import uuid
-        
-        response = ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4().hex}",
-            created=int(time.time()),
-            model=request.model,
-            choices=[
-                ChatChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=llm_response),
-                    finish_reason="stop"
-                )
-            ],
-            usage={
-                "prompt_tokens": sum(len(msg["content"]) // 4 for msg in messages),  # 粗略估计
-                "completion_tokens": len(llm_response) // 4,  # 粗略估计
-                "total_tokens": sum(len(msg["content"]) // 4 for msg in messages) + len(llm_response) // 4
+        # 直接使用 httpx 发送API请求，绕过 LLMClient
+        try:
+            # 准备请求参数
+            url = f"{config.base_url}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {config.llm_api_key}",
             }
-        )
-        
-        return response
+            
+            # 处理Silicon Flow特定的模型命名，如果需要的话
+            model = request.model
+            if "siliconflow.cn" in config.base_url and model == "gpt-3.5-turbo":
+                # 如果是默认的gpt-3.5-turbo但实际使用siliconflow，使用配置中的默认模型
+                model = config.default_model
+            
+            payload = {
+                "model": model,
+                "messages": messages,  # 已经是正确的字典格式
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+                "top_p": request.top_p,
+                "stream": False
+            }
+            
+            logging.debug(f"API请求URL: {url}")
+            logging.debug(f"API请求头: {headers}")
+            logging.debug(f"API请求负载: {json.dumps(payload, ensure_ascii=False)}")
+            
+            timeout = httpx.Timeout(30.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                logging.info(f"API响应状态: {response.status_code} {response.reason_phrase}")
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    logging.error(f"API错误响应: {error_text}")
+                    
+                    # 尝试解析错误JSON以获取更详细信息
+                    try:
+                        error_json = response.json()
+                        if "error" in error_json:
+                            error_text = json.dumps(error_json["error"])
+                    except:
+                        pass  # 如果不是JSON或没有error字段，就使用原始文本
+                        
+                    raise HTTPException(
+                        status_code=response.status_code, 
+                        detail=f"LLM API错误: {error_text}"
+                    )
+                
+                # 解析成功的响应
+                data = response.json()
+                logging.debug(f"API返回数据: {json.dumps(data, ensure_ascii=False)}")
+                
+                llm_response = data["choices"][0]["message"]["content"]
+                
+                # 创建OpenAI格式的响应
+                import time
+                import uuid
+                
+                response = ChatCompletionResponse(
+                    id=data.get("id", f"chatcmpl-{uuid.uuid4().hex}"),
+                    created=data.get("created", int(time.time())),
+                    model=data.get("model", model),
+                    choices=[
+                        ChatChoice(
+                            index=0,
+                            message=ChatMessage(role="assistant", content=llm_response),
+                            finish_reason=data["choices"][0].get("finish_reason", "stop")
+                        )
+                    ],
+                    usage=data.get("usage", {
+                        "prompt_tokens": sum(len(msg["content"]) // 4 for msg in messages),
+                        "completion_tokens": len(llm_response) // 4,
+                        "total_tokens": sum(len(msg["content"]) // 4 for msg in messages) + len(llm_response) // 4
+                    })
+                )
+                
+                return response
+                
+        except Exception as e:
+            logging.error(f"调用API时出错: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"调用API出错: {str(e)}")
         
     except Exception as e:
         logging.error(f"处理聊天完成请求时出错: {e}", exc_info=True)
